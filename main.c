@@ -55,23 +55,27 @@
 
 struct drm_buffer {
 	unsigned int fourcc;
-	unsigned int bo_handle;
+	uint32_t handles[AV_DRM_MAX_PLANES];
 	unsigned int fb_handle;
-	int dbuf_fd;
-	void *mmap_buf;
-	uint32_t pitches[4];
-	uint32_t offsets[4];
-	uint32_t bo_handles[4];
+	uint32_t pitches[AV_DRM_MAX_PLANES];
+	uint32_t offsets[AV_DRM_MAX_PLANES];
+	uint64_t modifiers[AV_DRM_MAX_PLANES];
+	uint32_t bo_handles[AV_DRM_MAX_PLANES];
 };
 
 struct drm_dev {
 	int fd;
-	uint32_t conn_id, enc_id, crtc_id, fb_id, plane_id, crtc_idx;
+	uint32_t conn_id, enc_id, crtc_id, plane_id, crtc_idx;
 	uint32_t width, height;
 	uint32_t pitch, size, handle;
 	drmModeModeInfo mode;
 	drmModeCrtc *saved_crtc;
+	drmModeAtomicReq *req;
+	drmEventContext drm_event_ctx;
+	uint32_t count_props;
+	drmModePropertyPtr props[128];
 	struct drm_dev *next;
+	struct drm_buffer *bufs[2]; // double buffering
 };
 
 static struct drm_dev *pdev;
@@ -92,49 +96,109 @@ static unsigned int drm_format;
 #define info(msg, ...) print(msg "\n", ##__VA_ARGS__)
 #define dbg(msg, ...)  print(DBG_TAG ": " msg "\n", ##__VA_ARGS__)
 
+static void page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
+			      unsigned int tv_usec, void *user_data)
+{
+	// Nothing to do.
+}
+
+int drm_get_plane_props(int fd, uint32_t id)
+{
+	uint32_t i;
+
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, id, DRM_MODE_OBJECT_PLANE);
+	if (!props) {
+		err("drmModeObjectGetProperties failed\n");
+		return -1;
+	}
+	printf("Found %u props\n", props->count_props);
+	pdev->count_props = props->count_props;
+	for (i = 0; i < props->count_props; i++) {
+		pdev->props[i] = drmModeGetProperty(fd, props->props[i]);
+		print("Added prop %u:%s\n", pdev->props[i]->prop_id, pdev->props[i]->name);
+	}
+
+	return 0;
+}
+
+uint32_t get_property_id(const char *name)
+{
+	uint32_t i;
+
+	for (i = 0; i < pdev->count_props; ++i)
+		if (!strcmp(pdev->props[i]->name, name))
+			return pdev->props[i]->prop_id;
+
+	return 0;
+}
+
+int drm_add_property(const char *name, uint64_t value)
+{
+	int ret;
+	uint32_t prop_id = get_property_id(name);
+
+	if (!prop_id) {
+		err("Couldn't find prop %s\n", name);
+		return -1;
+	}
+
+	ret = drmModeAtomicAddProperty(pdev->req, pdev->plane_id, get_property_id(name), value);
+	if (ret < 0) {
+		err("drmModeAtomicAddProperty (%s:%lu) failed: %d\n", name, value, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 			 uint32_t height, int fullscreen)
 {
-	uint32_t crtc_w, crtc_h;
+	int ret;
+	fd_set fds;
+	FD_ZERO(&fds);
+	FD_SET(pdev->fd, &fds);
 
-	crtc_w = width;
-	crtc_h = height;
+	drm_add_property("FB_ID", buf->fb_handle);
+	drm_add_property("CRTC_ID", pdev->crtc_id);
+	drm_add_property("SRC_X", 0);
+	drm_add_property("SRC_Y", 0);
+	drm_add_property("SRC_W", width << 16);
+	drm_add_property("SRC_H", height << 16);
+	drm_add_property("CRTC_X", 0);
+	drm_add_property("CRTC_Y", 0);
+	drm_add_property("CRTC_W", pdev->width);
+	drm_add_property("CRTC_H", pdev->height);
 
-	if (fullscreen) {
-		crtc_w = pdev->width;
-		crtc_h = pdev->height;
+	ret = drmModeAtomicCommit(pdev->fd, pdev->req, DRM_MODE_PAGE_FLIP_EVENT  | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+	if (ret) {
+		err("drmModeAtomicCommit failed: %s\n", strerror(errno));
+		return ret;
 	}
 
-	return drmModeSetPlane(pdev->fd, pdev->plane_id, pdev->crtc_id,
-		      buf->fb_handle, 0,
-		      0, 0, crtc_w, crtc_h,
-		      0, 0, width << 16, height << 16);
-}
+	do {
+		ret = select(pdev->fd + 1, &fds, NULL, NULL, NULL);
+	} while (ret == -1 && errno == EINTR);
 
-static int drm_dmabuf_import(struct drm_buffer *buf, unsigned int width,
-		      unsigned int height)
-{
-	return drmPrimeFDToHandle(pdev->fd, buf->dbuf_fd, &buf->bo_handle);
+	if (FD_ISSET(pdev->fd, &fds))
+		drmHandleEvent(pdev->fd, &pdev->drm_event_ctx);
+
+	drmModeAtomicFree(pdev->req);
+	pdev->req = drmModeAtomicAlloc();
+
+	return 0;
 }
 
 static int drm_dmabuf_addfb(struct drm_buffer *buf, uint32_t width, uint32_t height)
 {
 	int ret;
 
-	if (width > pdev->width)
-		width = pdev->width;
-	if (height > pdev->height)
-		height = pdev->height;
-
 	width = ALIGN(width, 8);
 
-	uint32_t stride = DRM_ALIGN(width, 128);
-	uint32_t y_scanlines = DRM_ALIGN(height, 32);
-
-	ret = drmModeAddFB2(pdev->fd, width, height, buf->fourcc, buf->bo_handles,
-			    buf->pitches, buf->offsets, &buf->fb_handle, 0);
+	ret = drmModeAddFB2WithModifiers(pdev->fd, width, height, buf->fourcc, buf->handles,
+			    buf->pitches, buf->offsets, buf->modifiers, &buf->fb_handle, 0);
 	if (ret) {
-		err("drmModeAddFB2 failed: %d (%s)\n", ret, strerror(errno));
+		err("drmModeAddFB2 failed: %d (%s). width=%u, height=%u\n", ret, strerror(errno), width, height);
 		return ret;
 	}
 
@@ -276,7 +340,7 @@ static struct drm_dev *drm_find_dev(int fd)
 	}
 
 	if (dev->crtc_idx == -1)
-		err( "drm: CRTC %u not found\n");
+		err( "drm: CRTC not found\n");
 
 free_res:
 	drmModeFreeResources(res);
@@ -320,12 +384,21 @@ err:
 static int drm_init(unsigned int fourcc, const char *device)
 {
 	struct drm_dev *dev_head, *dev;
+	drmModeAtomicReq *req ;
 	int fd;
 	int ret;
 
 	fd = drm_open(device);
 	if (fd < 0)
 		return -1;
+
+	ret = drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+	if (ret) {
+		err("No atomic modesetting support: %s", strerror(errno));
+		goto err;
+	}
+
+	req = drmModeAtomicAlloc();
 
 	dev_head = drm_find_dev(fd);
 	if (dev_head == NULL) {
@@ -337,14 +410,15 @@ static int drm_init(unsigned int fourcc, const char *device)
 
 	for (dev = dev_head; dev != NULL; dev = dev->next) {
 		dbg("connector id:%d", dev->conn_id);
-		dbg("\tencoder id:%d crtc id:%d fb id:%d", dev->enc_id,
-		    dev->crtc_id, dev->fb_id);
+		dbg("\tencoder id:%d crtc id:%d", dev->enc_id,
+		    dev->crtc_id);
 		dbg("\twidth:%d height:%d", dev->width, dev->height);
 	}
 
 	/* FIXME: use first drm_dev */
 	dev = dev_head;
 	dev->fd = fd;
+	dev->req = req;
 	pdev = dev;
 
 	ret = find_plane(fd, fourcc, &dev->plane_id, dev->crtc_id, dev->crtc_idx);
@@ -353,7 +427,11 @@ static int drm_init(unsigned int fourcc, const char *device)
 		goto err;
 	}
 
-	info("drm: Found %c%c%c%c plane_id: %x",
+	ret = drm_get_plane_props(fd, dev->plane_id);
+	pdev->drm_event_ctx.version = DRM_EVENT_CONTEXT_VERSION;
+	pdev->drm_event_ctx.page_flip_handler = page_flip_handler;
+
+	info("drm: Found %c%c%c%c plane_id: %u",
 		(fourcc>>0)&0xff, (fourcc>>8)&0xff, (fourcc>>16)&0xff, (fourcc>>24)&0xff,
 		dev->plane_id);
 
@@ -369,16 +447,7 @@ static int display(struct drm_buffer *drm_buf, int width, int height)
 {
         struct drm_gem_close gem_close;
         int ret;
-
-	ret = drm_dmabuf_import(drm_buf, width, height);
-	if (ret) {
-		err("cannot import dmabuf %d, fd=%d\n", ret, drm_buf->dbuf_fd);
-		return -EFAULT;
-	}
-	drm_buf->bo_handles[0] = drm_buf->bo_handle;
-	drm_buf->bo_handles[1] = drm_buf->bo_handle;
-	drm_buf->bo_handles[2] = drm_buf->bo_handle;
-	drm_buf->bo_handles[3] = drm_buf->bo_handle;
+	int i;
 
 	ret = drm_dmabuf_addfb(drm_buf, width, height);
 	if (ret) {
@@ -388,30 +457,23 @@ static int display(struct drm_buffer *drm_buf, int width, int height)
 
 	drm_dmabuf_set_plane(drm_buf, width, height, 1);
 
-        /* WARNING: this will _obviously_ cause the screen to flicker!!
-         *
-         *   Instead of using some simple stuff to postpone the release actions
-         *   (a list or a ping/ping buffer or whatever) we will just keep it
-         *   this way for clarity.
-         *
-         *   1. the client MUST remove the fb_handle
-         *   2. the client MUST close the bo_handle (GEM object)
-         *
-         *   Not doing so will cause FFMPEG to _fail_ when releasing the capture
-         *   mmap'ed buffers since the dmabufs are exported to DRM and therefore
-         *   DRM keeps a reference to those buffers.
-         *
-         *   REQBUFS --> MMAP --> EXPBUF --> fb_handle / bo_handle
-         *
-         *   ==> releasing the buffers requires the handles to be released
-         */
-        if (drmModeRmFB(pdev->fd, drm_buf->fb_handle))
-            err("cant remove fb %d\n", drm_buf->fb_handle);
+	if (pdev->bufs[1]) {
+		if (drmModeRmFB(pdev->fd, pdev->bufs[1]->fb_handle))
+		    err("cant remove fb %d\n", pdev->bufs[1]->fb_handle);
 
-        memset(&gem_close, 0, sizeof gem_close);
-        gem_close.handle = drm_buf->bo_handle;
-        if (drmIoctl(pdev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
-            err("cant close gem: %s\n", strerror(errno));
+		for (i = 0; i < AV_DRM_MAX_PLANES; i++) {
+			if (pdev->bufs[1]->bo_handles[i]) {
+				memset(&gem_close, 0, sizeof gem_close);
+				gem_close.handle = pdev->bufs[1]->bo_handles[i];
+				if (drmIoctl(pdev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
+				    err("cant close gem: %s\n", strerror(errno));
+			}
+		}
+		free(pdev->bufs[1]);
+	}
+
+	pdev->bufs[1] = pdev->bufs[0];
+	pdev->bufs[0] = drm_buf;
 
 	return 0;
 }
@@ -419,8 +481,8 @@ static int display(struct drm_buffer *drm_buf, int width, int height)
 static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 			AVPacket *pkt, const char *device)
 {
-	AVDRMFrameDescriptor *desc = NULL;
-	struct drm_buffer drm_buf;
+	AVDRMFrameDescriptor *desc;
+	AVDRMLayerDescriptor* layer;
 	int ret;
 
 	ret = avcodec_send_packet(dec_ctx, pkt);
@@ -430,6 +492,7 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 	}
 
 	while (ret >= 0) {
+		struct drm_buffer *drm_buf = calloc(1, sizeof(*drm_buf));
 		ret = avcodec_receive_frame(dec_ctx, frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
 			return;
@@ -439,27 +502,43 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 		}
 
 		desc = (AVDRMFrameDescriptor *) frame->data[0];
-		drm_buf.dbuf_fd = desc->objects[0].fd;
-		for (int i = 0; i < desc->layers->nb_planes && i < 4; i++ ) {
-			drm_buf.pitches[i] = desc->layers->planes[i].pitch;
-			drm_buf.offsets[i] = desc->layers->planes[i].offset;
-		}
+		layer = &desc->layers[0];
 
                 if (!pdev) {
                     /* initialize DRM with the format returned in the frame */
-                    ret = drm_init(desc->layers[0].format, device);
+                    ret = drm_init(layer->format, device);
                     if (ret) {
                         err("Error initializing drm\n");
                         exit(1);
                     }
 
                     /* remember the format */
-                    drm_format = desc->layers[0].format;
+                    drm_format = layer->format;
                 }
 
-                /* pass the format in the buffer */
-                drm_buf.fourcc = drm_format;
-		ret = display(&drm_buf, frame->width, frame->height);
+		// convert Prime FD to GEM handle
+		for (int i = 0; i < desc->nb_objects; i++) {
+			ret = drmPrimeFDToHandle(pdev->fd, desc->objects[i].fd, &drm_buf->bo_handles[i]);
+			if (ret < 0) {
+				err("Failed FDToHandle\n");
+				return;
+			}
+		}
+
+		for (int i = 0; i < layer->nb_planes && i < AV_DRM_MAX_PLANES; i++) {
+			int object = layer->planes[i].object_index;
+			uint32_t handle = drm_buf->bo_handles[object];
+			if (handle && layer->planes[i].pitch) {
+				drm_buf->handles[i] = handle;
+				drm_buf->pitches[i] = layer->planes[i].pitch;
+				drm_buf->offsets[i] = layer->planes[i].offset;
+				drm_buf->modifiers[i] = desc->objects[object].format_modifier;
+			}
+		}
+
+		/* pass the format in the buffer */
+		drm_buf->fourcc = drm_format;
+		ret = display(drm_buf, frame->width, frame->height);
 		if (ret < 0)
 			return;
     }
@@ -515,7 +594,7 @@ static void usage(void)
 	fprintf(stderr, "--codec=<name>    ffmpeg codec: ie h264_v4l2m2m\n");
 	fprintf(stderr, "--width=<value>   frame width\n");
 	fprintf(stderr, "--height=<value>  frame height\n");
-    fprintf(stderr, "--device=<value>  dri device to use\n");
+	fprintf(stderr, "--device=<value>  dri device to use\n");
 	fprintf(stderr, "\n");
 }
 
@@ -559,7 +638,7 @@ int main(int argc, char *argv[])
 		case height_opt:
 			frame_height = atoi(optarg);
 			break;
-        case device_opt:
+		case device_opt:
 			device_name = optarg;
 			break;
 		default:
@@ -607,7 +686,7 @@ int main(int argc, char *argv[])
 	   calling avcodec_open2) because this information is not available in
 	   the bitstream). */
 	c->pix_fmt = AV_PIX_FMT_DRM_PRIME;   /* request a DRM frame */
-        c->coded_height = frame_height;
+	c->coded_height = frame_height;
 	c->coded_width = frame_width;
 
 	/* open it */
