@@ -483,6 +483,7 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 {
 	AVDRMFrameDescriptor *desc;
 	AVDRMLayerDescriptor* layer;
+	struct drm_buffer *drm_buf;
 	int ret;
 
 	ret = avcodec_send_packet(dec_ctx, pkt);
@@ -492,7 +493,6 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 	}
 
 	while (ret >= 0) {
-		struct drm_buffer *drm_buf = calloc(1, sizeof(*drm_buf));
 		ret = avcodec_receive_frame(dec_ctx, frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
 			return;
@@ -516,6 +516,7 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
                     drm_format = layer->format;
                 }
 
+		drm_buf = calloc(1, sizeof(*drm_buf));
 		// convert Prime FD to GEM handle
 		for (int i = 0; i < desc->nb_objects; i++) {
 			ret = drmPrimeFDToHandle(pdev->fd, desc->objects[i].fd, &drm_buf->bo_handles[i]);
