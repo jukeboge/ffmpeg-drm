@@ -443,11 +443,28 @@ err:
 	return -1;
 }
 
+static void drm_remove_fb(struct drm_buffer *drm_buf)
+{
+	struct drm_gem_close gem_close;
+	int i;
+
+	if (drmModeRmFB(pdev->fd, drm_buf->fb_handle))
+		err("cant remove fb %d\n", drm_buf->fb_handle);
+
+	for (i = 0; i < AV_DRM_MAX_PLANES; i++) {
+		if (drm_buf->bo_handles[i]) {
+			memset(&gem_close, 0, sizeof gem_close);
+			gem_close.handle = drm_buf->bo_handles[i];
+			if (drmIoctl(pdev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
+				err("cant close gem: %s\n", strerror(errno));
+		}
+	}
+	free(drm_buf);
+}
+
 static int display(struct drm_buffer *drm_buf, int width, int height)
 {
-        struct drm_gem_close gem_close;
         int ret;
-	int i;
 
 	ret = drm_dmabuf_addfb(drm_buf, width, height);
 	if (ret) {
@@ -457,20 +474,8 @@ static int display(struct drm_buffer *drm_buf, int width, int height)
 
 	drm_dmabuf_set_plane(drm_buf, width, height, 1);
 
-	if (pdev->bufs[1]) {
-		if (drmModeRmFB(pdev->fd, pdev->bufs[1]->fb_handle))
-		    err("cant remove fb %d\n", pdev->bufs[1]->fb_handle);
-
-		for (i = 0; i < AV_DRM_MAX_PLANES; i++) {
-			if (pdev->bufs[1]->bo_handles[i]) {
-				memset(&gem_close, 0, sizeof gem_close);
-				gem_close.handle = pdev->bufs[1]->bo_handles[i];
-				if (drmIoctl(pdev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
-				    err("cant close gem: %s\n", strerror(errno));
-			}
-		}
-		free(pdev->bufs[1]);
-	}
+	if (pdev->bufs[1])
+		drm_remove_fb(pdev->bufs[1]);
 
 	pdev->bufs[1] = pdev->bufs[0];
 	pdev->bufs[0] = drm_buf;
@@ -733,9 +738,13 @@ int main(int argc, char *argv[])
 	}
 	fclose(f);
 
-        decode_and_display(c, frame, NULL, device_name);
+	decode_and_display(c, frame, NULL, device_name);
+	if (pdev->bufs[0])
+		drm_remove_fb(pdev->bufs[0]);
+	if (pdev->bufs[1])
+		drm_remove_fb(pdev->bufs[1]);
 
-        av_parser_close(parser);
+	av_parser_close(parser);
 	avcodec_free_context(&c);
 	av_frame_free(&frame);
 	av_packet_free(&pkt);
