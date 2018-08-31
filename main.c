@@ -117,6 +117,7 @@ int drm_get_plane_props(int fd, uint32_t id)
 		pdev->props[i] = drmModeGetProperty(fd, props->props[i]);
 		print("Added prop %u:%s\n", pdev->props[i]->prop_id, pdev->props[i]->name);
 	}
+	drmModeFreeObjectProperties(props);
 
 	return 0;
 }
@@ -314,8 +315,10 @@ static struct drm_dev *drm_find_dev(int fd)
 				}
 				if (enc->crtc_id) {
 					crtc = drmModeGetCrtc(fd, enc->crtc_id);
-					if (crtc)
+					if (crtc) {
 						dev->crtc_id = enc->crtc_id;
+						drmModeFreeCrtc(crtc);
+					}
 				}
 				drmModeFreeEncoder(enc);
 			}
