@@ -317,9 +317,8 @@ static struct drm_dev *drm_find_dev(int fd)
 					if (crtc)
 						dev->crtc_id = enc->crtc_id;
 				}
+				drmModeFreeEncoder(enc);
 			}
-
-			drmModeFreeEncoder(enc);
 
 			dev->saved_crtc = NULL;
 
