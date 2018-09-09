@@ -153,12 +153,34 @@ int drm_add_property(const char *name, uint64_t value)
 }
 
 int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
-			 uint32_t height, int fullscreen)
+			 uint32_t height, int fullscreen, AVRational sar)
 {
 	int ret;
+	uint32_t crtc_w;
+	uint32_t crtc_h;
+	uint32_t crtc_x = 0;
+	uint32_t crtc_y = 0;
+	double ratio_w;
+	double ratio_h;
+
 	fd_set fds;
 	FD_ZERO(&fds);
 	FD_SET(pdev->fd, &fds);
+
+	crtc_w = (width * sar.num) / sar.den;
+	crtc_h = height;
+	ratio_w = (double)pdev->width / crtc_w;
+	ratio_h = (double)pdev->height / crtc_h;
+
+	if (ratio_w > ratio_h) {
+		crtc_w *= ratio_h;
+		crtc_h *= ratio_h;
+		crtc_x = (pdev->width - crtc_w) / 2;
+	} else {
+		crtc_w *= ratio_w;
+		crtc_h *= ratio_w;
+		crtc_y = (pdev->height - crtc_h) / 2;
+	}
 
 	drm_add_property("FB_ID", buf->fb_handle);
 	drm_add_property("CRTC_ID", pdev->crtc_id);
@@ -166,10 +188,10 @@ int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 	drm_add_property("SRC_Y", 0);
 	drm_add_property("SRC_W", width << 16);
 	drm_add_property("SRC_H", height << 16);
-	drm_add_property("CRTC_X", 0);
-	drm_add_property("CRTC_Y", 0);
-	drm_add_property("CRTC_W", pdev->width);
-	drm_add_property("CRTC_H", pdev->height);
+	drm_add_property("CRTC_X", crtc_x);
+	drm_add_property("CRTC_Y", crtc_y);
+	drm_add_property("CRTC_W", crtc_w);
+	drm_add_property("CRTC_H", crtc_h);
 
 	ret = drmModeAtomicCommit(pdev->fd, pdev->req, DRM_MODE_PAGE_FLIP_EVENT  | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
 	if (ret) {
@@ -464,7 +486,7 @@ static void drm_remove_fb(struct drm_buffer *drm_buf)
 	free(drm_buf);
 }
 
-static int display(struct drm_buffer *drm_buf, int width, int height)
+static int display(struct drm_buffer *drm_buf, int width, int height, AVRational sar)
 {
         int ret;
 
@@ -474,7 +496,7 @@ static int display(struct drm_buffer *drm_buf, int width, int height)
 		return -EFAULT;
 	}
 
-	drm_dmabuf_set_plane(drm_buf, width, height, 1);
+	drm_dmabuf_set_plane(drm_buf, width, height, 1, sar);
 
 	if (pdev->bufs[1])
 		drm_remove_fb(pdev->bufs[1]);
@@ -546,7 +568,7 @@ static void decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
 
 		/* pass the format in the buffer */
 		drm_buf->fourcc = drm_format;
-		ret = display(drm_buf, frame->width, frame->height);
+		ret = display(drm_buf, frame->width, frame->height, frame->sample_aspect_ratio);
 		if (ret < 0)
 			return;
     }
