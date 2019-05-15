@@ -80,6 +80,7 @@ struct drm_dev {
 
 static struct drm_dev *pdev;
 static unsigned int drm_format;
+static int disable_plane_id = 0;
 
 #define DBG_TAG "  ffmpeg-drm"
 
@@ -95,6 +96,87 @@ static unsigned int drm_format;
 #define err(msg, ...)  print("error: " msg "\n", ##__VA_ARGS__)
 #define info(msg, ...) print(msg "\n", ##__VA_ARGS__)
 #define dbg(msg, ...)  print(DBG_TAG ": " msg "\n", ##__VA_ARGS__)
+
+uint32_t get_property_id(const char *name)
+{
+	uint32_t i;
+
+	for (i = 0; i < pdev->count_props; ++i)
+		if (!strcmp(pdev->props[i]->name, name))
+			return pdev->props[i]->prop_id;
+
+	return 0;
+}
+
+void set_plane_transparent(int plane_id)
+{
+	struct drm_mode_create_dumb creq;
+	struct drm_mode_map_dumb mreq;
+	uint32_t fb;
+	int ret;
+	void *map;
+	int handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
+
+	/* create dumb buffer */
+	memset(&creq, 0, sizeof(creq));
+	creq.width = pdev->width;
+	creq.height = pdev->height;
+	creq.bpp = 32;
+	ret = drmIoctl(pdev->fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+	if (ret < 0) {
+		printf("DRM_IOCTL_MODE_CREATE_DUMB fail\n");
+		return;
+	}
+	/* creq.pitch, creq.handle and creq.size are filled by this ioctl with
+	 * the requested values and can be used now. */
+
+	/* the framebuffer "fb" can now used for scanout with KMS */
+
+	/* prepare buffer for memory mapping */
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.handle = creq.handle;
+	ret = drmIoctl(pdev->fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
+	if (ret) {
+		printf("DRM_IOCTL_MODE_MAP_DUMB fail\n");
+		return;
+	}
+	/* mreq.offset now contains the new offset that can be used with mmap() */
+
+	/* perform actual memory mapping */
+	map = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, pdev->fd, mreq.offset);
+	if (map == MAP_FAILED) {
+		printf("mmap fail\n");
+		return;
+	}
+
+	/* clear the framebuffer to 0 (= full transparency in ARGB8888) */
+	memset(map, 0, creq.size);
+	munmap(map, creq.size);
+
+	printf("size = %llu ; pitch = %u\n", creq.size, creq.pitch);
+
+	handles[0] = creq.handle;
+	pitches[0] = creq.pitch;
+	offsets[0] = 0;
+	/* create framebuffer object for the dumb-buffer */
+	ret = drmModeAddFB2(pdev->fd, pdev->width, pdev->height, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0);
+	if (ret) {
+		printf("drmModeAddFB fail\n");
+		return;
+	}
+
+	printf("Setting FB_ID %u; width %u; height %u; plane %u\n", fb, pdev->width, pdev->height, plane_id);
+
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("FB_ID"), fb);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("SRC_X"), 0);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("SRC_Y"), 0);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("SRC_W"), pdev->width << 16);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("SRC_H"), pdev->height << 16);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("CRTC_X"), 0);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("CRTC_Y"), 0);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("CRTC_W"), pdev->width);
+	ret = drmModeAtomicAddProperty(pdev->req, plane_id, get_property_id("CRTC_H"), pdev->height);
+}
 
 static void page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
 			      unsigned int tv_usec, void *user_data)
@@ -118,17 +200,6 @@ int drm_get_plane_props(int fd, uint32_t id)
 		print("Added prop %u:%s\n", pdev->props[i]->prop_id, pdev->props[i]->name);
 	}
 	drmModeFreeObjectProperties(props);
-
-	return 0;
-}
-
-uint32_t get_property_id(const char *name)
-{
-	uint32_t i;
-
-	for (i = 0; i < pdev->count_props; ++i)
-		if (!strcmp(pdev->props[i]->name, name))
-			return pdev->props[i]->prop_id;
 
 	return 0;
 }
@@ -182,6 +253,8 @@ int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 		crtc_y = (pdev->height - crtc_h) / 2;
 	}
 
+	printf("crtc_x: %u; crtc_y:%u; crtc_w: %u; crtc_h: %u\n", crtc_x, crtc_y, crtc_w, crtc_h);
+
 	drm_add_property("FB_ID", buf->fb_handle);
 	drm_add_property("CRTC_ID", pdev->crtc_id);
 	drm_add_property("SRC_X", 0);
@@ -192,6 +265,11 @@ int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 	drm_add_property("CRTC_Y", crtc_y);
 	drm_add_property("CRTC_W", crtc_w);
 	drm_add_property("CRTC_H", crtc_h);
+
+	if (disable_plane_id) {
+		set_plane_transparent(disable_plane_id);
+		disable_plane_id = 0;
+	}
 
 	ret = drmModeAtomicCommit(pdev->fd, pdev->req, DRM_MODE_PAGE_FLIP_EVENT  | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
 	if (ret) {
@@ -612,6 +690,12 @@ static const struct option options[] = {
 		.flag = NULL,
 	},
 	{
+#define disable_plane_opt	6
+		.name = "disable-plane",
+		.has_arg = 1,
+		.flag = NULL,
+	},
+	{
 		.name = NULL,
 	},
 };
@@ -643,7 +727,8 @@ int main(int argc, char *argv[])
 	int lindex, opt;
 	unsigned int frame_width = 0, frame_height = 0;
 	char *codec_name = NULL, *video_name = NULL;
-    char *device_name = "/dev/dri/card0";
+	char *device_name = "/dev/dri/card0";
+	AVDictionary *opts = NULL;
 
 	for (;;) {
 		lindex = -1;
@@ -670,6 +755,9 @@ int main(int argc, char *argv[])
 			break;
 		case device_opt:
 			device_name = optarg;
+			break;
+		case disable_plane_opt:
+			disable_plane_id = atoi(optarg);
 			break;
 		default:
 			usage();
@@ -719,8 +807,10 @@ int main(int argc, char *argv[])
 	c->coded_height = frame_height;
 	c->coded_width = frame_width;
 
+	av_dict_set(&opts, "num_capture_buffers", "16", 0);
+
 	/* open it */
-	if (avcodec_open2(c, codec, NULL) < 0) {
+	if (avcodec_open2(c, codec, &opts) < 0) {
 		err("Could not open codec\n");
 		exit(1);
 	}
