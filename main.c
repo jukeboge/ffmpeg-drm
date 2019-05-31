@@ -238,6 +238,11 @@ int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 	FD_ZERO(&fds);
 	FD_SET(pdev->fd, &fds);
 
+	if (!sar.num || !sar.den) {
+		sar.num = 1;
+		sar.den = 1;
+	}
+
 	crtc_w = (width * sar.num) / sar.den;
 	crtc_h = height;
 	ratio_w = (double)pdev->width / crtc_w;
