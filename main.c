@@ -47,11 +47,23 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/pixfmt.h>
 
 #define ALIGN(x, a)		((x) + (a - 1)) & (~(a - 1))
 #define DRM_ALIGN(val, align)	((val + (align - 1)) & ~(align - 1))
 
 #define INBUF_SIZE 4096
+
+enum AVPixelFormat get_format(AVCodecContext* Context, const enum AVPixelFormat *PixFmt)
+{
+    while (*PixFmt != AV_PIX_FMT_NONE)
+    {
+        if (*PixFmt == AV_PIX_FMT_DRM_PRIME)
+            return AV_PIX_FMT_DRM_PRIME;
+        PixFmt++;
+    }
+    return AV_PIX_FMT_NONE;
+}
 
 struct drm_buffer {
 	unsigned int fourcc;
@@ -811,6 +823,7 @@ int main(int argc, char *argv[])
 	c->pix_fmt = AV_PIX_FMT_DRM_PRIME;   /* request a DRM frame */
 	c->coded_height = frame_height;
 	c->coded_width = frame_width;
+        c->get_format = get_format;
 
 	av_dict_set(&opts, "num_capture_buffers", "16", 0);
 
